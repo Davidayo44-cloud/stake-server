@@ -1,14 +1,24 @@
+// server/index.js
 const express = require("express");
 const { Relayer } = require("@openzeppelin/defender-sdk-relay-signer-client");
 const bodyParser = require("body-parser");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const { ethers } = require("ethers");
+const mongoose = require("mongoose");
+const Suspension = require("./models/suspension");
+const { adminMiddleware } = require("./middleware/auth");
 
 dotenv.config();
 
 // Validate environment variables
-const requiredEnvVars = ["DEFENDER_API_KEY", "DEFENDER_API_SECRET", "RPC_URL"];
+const requiredEnvVars = [
+  "DEFENDER_API_KEY",
+  "DEFENDER_API_SECRET",
+  "RPC_URL",
+  "MONGO_URI",
+  "ADMIN_ADDRESS",
+];
 const missingEnvVars = requiredEnvVars.filter((key) => !process.env[key]);
 if (missingEnvVars.length > 0) {
   console.error("Missing environment variables:", missingEnvVars);
@@ -17,12 +27,17 @@ if (missingEnvVars.length > 0) {
 
 const app = express();
 
-// Enable CORS for http://localhost:5173
+// Enable CORS
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL||"http://localhost:5173",
-    methods: ["POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
+    origin: process.env.FRONTEND_URL || "http://localhost:5173",
+    methods: ["POST", "GET", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "adminAddress",
+      "signature",
+      "userAddress", // Add userAddress here
+    ],
   })
 );
 
@@ -38,6 +53,18 @@ app.use((req, res, next) => {
   next();
 });
 
+// MongoDB connection
+mongoose
+  .connect(process.env.MONGO_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+  })
+  .then(() => console.log("MongoDB connected"))
+  .catch((err) => {
+    console.error("MongoDB connection error:", err);
+    process.exit(1);
+  });
+
 // Initialize Relayer client
 const relaySigner = new Relayer({
   apiKey: process.env.DEFENDER_API_KEY,
@@ -45,16 +72,89 @@ const relaySigner = new Relayer({
 });
 
 // Initialize ethers provider
-const RPC_URL = process.env.RPC_URL;
-console.log("Using RPC_URL:", RPC_URL);
-const provider = new ethers.JsonRpcProvider(RPC_URL);
+const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
+console.log("Using RPC_URL:", process.env.RPC_URL);
 
 // Import Staking Contract ABI
 const StakingContractABI = require("./StakingContractABI.json");
-
 console.log("Relay Signer and Provider Initialized");
 
-// Endpoint for Defender-relayed meta-transactions (e.g., staking)
+// Check suspension status
+app.get("/api/check-suspension/:address", async (req, res) => {
+  const { address } = req.params;
+  if (!ethers.isAddress(address)) {
+    return res.status(400).json({ error: "Invalid Ethereum address" });
+  }
+  try {
+    const suspension = await Suspension.findOne({
+      address: address.toLowerCase(),
+    });
+    res.json({
+      isSuspended: !!suspension,
+      reason: suspension ? suspension.reason : null,
+      suspendedAt: suspension ? suspension.suspendedAt : null,
+    });
+  } catch (error) {
+    console.error("Check suspension error:", error.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Suspend an account (admin only)
+app.post("/api/suspend", adminMiddleware, async (req, res) => {
+  const { address, reason } = req.body;
+  if (!ethers.isAddress(address)) {
+    return res.status(400).json({ error: "Invalid Ethereum address" });
+  }
+  try {
+    const suspension = new Suspension({
+      address: address.toLowerCase(),
+      reason: reason || "No reason provided",
+      admin: req.adminAddress,
+    });
+    await suspension.save();
+    res.json({ success: true, message: `Account ${address} suspended` });
+  } catch (error) {
+    if (error.code === 11000) {
+      return res.status(400).json({ error: "Account already suspended" });
+    }
+    console.error("Suspend error:", error.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Unsuspend an account (admin only)
+app.post("/api/unsuspend", adminMiddleware, async (req, res) => {
+  const { address } = req.body;
+  if (!ethers.isAddress(address)) {
+    return res.status(400).json({ error: "Invalid Ethereum address" });
+  }
+  try {
+    const result = await Suspension.findOneAndDelete({
+      address: address.toLowerCase(),
+    });
+    if (!result) {
+      return res.status(404).json({ error: "Account not suspended" });
+    }
+    res.json({ success: true, message: `Account ${address} unsuspended` });
+  } catch (error) {
+    console.error("Unsuspend error:", error.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Get all suspended accounts (admin only)
+app.get("/api/suspended-accounts", async (req, res) => {
+  try {
+    const suspensions = await Suspension.find();
+    res.json(suspensions);
+  } catch (error) {
+    console.error("Get suspended accounts error:", error.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Updated relayer endpoint with suspension check
 app.post("/relay", async (req, res) => {
   try {
     const {
@@ -86,6 +186,19 @@ app.post("/relay", async (req, res) => {
       return res.status(400).json({
         error:
           "Missing required fields: contractAddress, functionName, args, userAddress, signature, chainId",
+      });
+    }
+
+    // Check suspension status
+    const suspension = await Suspension.findOne({
+      address: userAddress.toLowerCase(),
+    });
+    if (suspension) {
+      console.log(
+        `Blocked meta-transaction for suspended user: ${userAddress}`
+      );
+      return res.status(403).json({
+        error: `Account is suspended: ${suspension.reason}`,
       });
     }
 
@@ -127,7 +240,7 @@ app.post("/relay", async (req, res) => {
         args
       ),
       gasLimit: 300000,
-      gasPrice: ethers.parseUnits("3", "gwei").toString(), // Convert BigInt to string
+      gasPrice: ethers.parseUnits("3", "gwei").toString(),
       chainId: Number(chainId),
       speed: speed || "fast",
       value: "0",
@@ -188,18 +301,14 @@ app.post("/relay", async (req, res) => {
       error.message.includes("authentication") ||
       error.message.includes("API key and secret are required")
     ) {
-      return res
-        .status(401)
-        .json({
-          error: "Authentication failed: Invalid or missing API credentials",
-        });
+      return res.status(401).json({
+        error: "Authentication failed: Invalid or missing API credentials",
+      });
     }
     if (error.message.includes("Insufficient funds")) {
-      return res
-        .status(403)
-        .json({
-          error: "Relayer has insufficient funds. Please fund the relayer.",
-        });
+      return res.status(403).json({
+        error: "Relayer has insufficient funds. Please fund the relayer.",
+      });
     }
     if (error.message.includes("status code 400")) {
       return res.status(400).json({

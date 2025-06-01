@@ -17,6 +17,7 @@
     "ethers": "^6.13.5",
     "express": "^5.1.0",
     "express-rate-limit": "^7.5.0",
+    "mongoose": "^8.15.1",
     "thirdweb": "^5.95.3"
   }
 }
