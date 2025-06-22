@@ -1,4 +1,3 @@
-// server/index.js
 const express = require("express");
 const { Relayer } = require("@openzeppelin/defender-sdk-relay-signer-client");
 const bodyParser = require("body-parser");
@@ -7,6 +6,7 @@ const dotenv = require("dotenv");
 const { ethers } = require("ethers");
 const mongoose = require("mongoose");
 const Suspension = require("./models/suspension");
+const Transaction = require("./models/Transaction");
 const { adminMiddleware } = require("./middleware/auth");
 
 dotenv.config();
@@ -18,6 +18,8 @@ const requiredEnvVars = [
   "RPC_URL",
   "MONGO_URI",
   "ADMIN_ADDRESS",
+  "FRONTEND_URL",
+  "PORT",
 ];
 const missingEnvVars = requiredEnvVars.filter((key) => !process.env[key]);
 if (missingEnvVars.length > 0) {
@@ -36,7 +38,8 @@ app.use(
       "Content-Type",
       "adminAddress",
       "signature",
-      "userAddress", // Add userAddress here
+      "userAddress",
+      "useraddress",
     ],
   })
 );
@@ -75,11 +78,203 @@ const relaySigner = new Relayer({
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
 console.log("Using RPC_URL:", process.env.RPC_URL);
 
-// Import Staking Contract ABI
-const StakingContractABI = require("./StakingContractABI.json");
-console.log("Relay Signer and Provider Initialized");
+// Create transaction
+app.post("/api/create-transaction", async (req, res) => {
+  const { userId, name, address, usdtAmount, nairaAmount } = req.body;
 
-// Check suspension status
+  if (
+    !ethers.isAddress(userId) ||
+    !name ||
+    !ethers.isAddress(address) ||
+    isNaN(usdtAmount) ||
+    isNaN(nairaAmount) ||
+    usdtAmount <= 0 ||
+    nairaAmount <= 0
+  ) {
+    console.error("Invalid transaction data:", req.body);
+    return res.status(400).json({ error: "Invalid transaction data" });
+  }
+
+  try {
+    const suspension = await Suspension.findOne({
+      address: userId.toLowerCase(),
+    });
+    if (suspension) {
+      return res.status(403).json({
+        error: `Account is suspended: ${suspension.reason}`,
+      });
+    }
+
+    // Check for existing pending transactions
+    const pendingTransaction = await Transaction.findOne({
+      userId: userId.toLowerCase(),
+      status: "pending",
+    });
+    if (pendingTransaction) {
+      return res.status(400).json({
+        error:
+          "You have a pending transaction. Please complete or cancel it before creating a new one.",
+        transactionId: pendingTransaction._id,
+      });
+    }
+
+    const transaction = new Transaction({
+      userId: userId.toLowerCase(),
+      name,
+      address: address.toLowerCase(),
+      usdtAmount,
+      nairaAmount,
+      status: "pending",
+    });
+    await transaction.save();
+    res.json({ transactionId: transaction._id });
+  } catch (error) {
+    console.error("Create transaction error:", error.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Mark transaction as paid
+app.post("/api/mark-paid", async (req, res) => {
+  const { transactionId } = req.body;
+
+  if (!mongoose.Types.ObjectId.isValid(transactionId)) {
+    console.error("Invalid transaction ID:", transactionId);
+    return res.status(400).json({ error: "Invalid transaction ID" });
+  }
+
+  try {
+    const transaction = await Transaction.findById(transactionId);
+    if (!transaction) {
+      console.error("Transaction not found:", transactionId);
+      return res.status(404).json({ error: "Transaction not found" });
+    }
+    if (transaction.status !== "pending") {
+      console.error("Transaction not in pending status:", transaction.status);
+      return res
+        .status(400)
+        .json({ error: `Transaction is in ${transaction.status} status` });
+    }
+
+    transaction.status = "awaiting verification";
+    transaction.updatedAt = Date.now();
+    await transaction.save();
+
+    console.log("Transaction marked as paid:", transactionId);
+    res.json({ success: true, transactionId });
+  } catch (error) {
+    console.error("Mark paid error:", error.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Verify transaction (admin only)
+app.post("/api/verify-transaction", adminMiddleware, async (req, res) => {
+  const { transactionId, status } = req.body;
+
+  if (!mongoose.Types.ObjectId.isValid(transactionId)) {
+    return res.status(400).json({ error: "Invalid transaction ID" });
+  }
+  if (!["verified", "failed"].includes(status)) {
+    return res.status(400).json({ error: "Invalid status" });
+  }
+
+  try {
+    const transaction = await Transaction.findById(transactionId);
+    if (!transaction) {
+      return res.status(404).json({ error: "Transaction not found" });
+    }
+    if (transaction.status !== "awaiting verification") {
+      return res.status(400).json({
+        error: `Transaction is in ${transaction.status} status`,
+      });
+    }
+
+    transaction.status = status;
+    transaction.updatedAt = Date.now();
+    await transaction.save();
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Verify transaction error:", error.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Get transactions (user-specific or admin)
+app.get("/api/transactions", async (req, res) => {
+  const userAddress = req.headers.useraddress || req.headers.userAddress;
+  const adminAddress = req.headers.adminaddress || req.headers.adminAddress;
+  const signature = req.headers.signature;
+
+  console.log("Transactions request headers:", {
+    userAddress,
+    adminAddress,
+    signature,
+  });
+
+  try {
+    // Admin access
+    if (adminAddress && signature) {
+      const message = "Admin access";
+      const signer = ethers.verifyMessage(message, signature).toLowerCase();
+      if (
+        signer === adminAddress.toLowerCase() &&
+        adminAddress.toLowerCase() === process.env.ADMIN_ADDRESS.toLowerCase()
+      ) {
+        const transactions = await Transaction.find().sort({ createdAt: -1 });
+        return res.json(transactions);
+      }
+    }
+
+    // User access
+    if (!userAddress) {
+      console.error("Missing user address header");
+      return res.status(400).json({ error: "Missing user address" });
+    }
+    if (!ethers.isAddress(userAddress)) {
+      console.error("Invalid user address:", userAddress);
+      return res.status(400).json({ error: "Invalid user address" });
+    }
+    const suspension = await Suspension.findOne({
+      address: userAddress.toLowerCase(),
+    });
+    if (suspension) {
+      return res.status(403).json({
+        error: `Account is suspended: ${suspension.reason}`,
+      });
+    }
+    const transactions = await Transaction.find({
+      userId: userAddress.toLowerCase(),
+    }).sort({ createdAt: -1 });
+    res.json(transactions);
+  } catch (error) {
+    console.error("Get transactions error:", error.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Check transaction status
+app.post("/api/check-status", async (req, res) => {
+  const { transactionId } = req.body;
+
+  if (!mongoose.Types.ObjectId.isValid(transactionId)) {
+    return res.status(400).json({ error: "Invalid transaction ID" });
+  }
+
+  try {
+    const transaction = await Transaction.findById(transactionId);
+    if (!transaction) {
+      return res.status(404).json({ error: "Transaction not found" });
+    }
+    res.json({ status: transaction.status });
+  } catch (error) {
+    console.error("Check status error:", error.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Suspension Routes
 app.get("/api/check-suspension/:address", async (req, res) => {
   const { address } = req.params;
   if (!ethers.isAddress(address)) {
@@ -100,7 +295,6 @@ app.get("/api/check-suspension/:address", async (req, res) => {
   }
 });
 
-// Suspend an account (admin only)
 app.post("/api/suspend", adminMiddleware, async (req, res) => {
   const { address, reason } = req.body;
   if (!ethers.isAddress(address)) {
@@ -123,7 +317,6 @@ app.post("/api/suspend", adminMiddleware, async (req, res) => {
   }
 });
 
-// Unsuspend an account (admin only)
 app.post("/api/unsuspend", adminMiddleware, async (req, res) => {
   const { address } = req.body;
   if (!ethers.isAddress(address)) {
@@ -143,7 +336,6 @@ app.post("/api/unsuspend", adminMiddleware, async (req, res) => {
   }
 });
 
-// Get all suspended accounts (admin only)
 app.get("/api/suspended-accounts", async (req, res) => {
   try {
     const suspensions = await Suspension.find();
@@ -154,7 +346,7 @@ app.get("/api/suspended-accounts", async (req, res) => {
   }
 });
 
-// Updated relayer endpoint with suspension check
+// Relay Endpoint
 app.post("/relay", async (req, res) => {
   try {
     const {
@@ -189,7 +381,6 @@ app.post("/relay", async (req, res) => {
       });
     }
 
-    // Check suspension status
     const suspension = await Suspension.findOne({
       address: userAddress.toLowerCase(),
     });
@@ -202,17 +393,6 @@ app.post("/relay", async (req, res) => {
       });
     }
 
-    console.log("Relaying meta-transaction:", {
-      contractAddress,
-      functionName,
-      args,
-      userAddress,
-      signature,
-      chainId,
-      speed,
-    });
-
-    // Validate chainId
     if (Number(chainId) !== 56) {
       console.error("Invalid chainId:", chainId);
       return res
@@ -220,7 +400,6 @@ app.post("/relay", async (req, res) => {
         .json({ error: "Invalid chainId, expected 56 (BSC)" });
     }
 
-    // Validate inputs
     if (!ethers.isAddress(contractAddress) || !ethers.isAddress(userAddress)) {
       console.error("Invalid address:", { contractAddress, userAddress });
       return res
@@ -232,7 +411,7 @@ app.post("/relay", async (req, res) => {
       return res.status(400).json({ error: "Invalid signature format" });
     }
 
-    // Construct transaction for Defender relayer
+    const StakingContractABI = require("./StakingContractABI.json");
     const tx = {
       to: contractAddress,
       data: new ethers.Interface(StakingContractABI).encodeFunctionData(
@@ -247,11 +426,9 @@ app.post("/relay", async (req, res) => {
     };
 
     console.log("Sending meta-transaction via Defender:", tx);
-
     const response = await relaySigner.sendTransaction(tx);
     console.log("Defender Relayer response:", response);
 
-    // Wait for transaction confirmation
     try {
       const receipt = await provider.waitForTransaction(
         response.hash,
@@ -266,9 +443,10 @@ app.post("/relay", async (req, res) => {
 
       if (receipt.status !== 1) {
         console.error("Transaction failed:", response.hash);
-        return res
-          .status(500)
-          .json({ error: "Transaction failed on-chain", hash: response.hash });
+        return res.status(500).json({
+          error: "Transaction failed on-chain",
+          hash: response.hash,
+        });
       }
 
       return res.json({ hash: response.hash, success: true });
