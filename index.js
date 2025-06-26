@@ -133,6 +133,35 @@ app.post("/api/create-transaction", async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+app.post("/api/cancel-transaction", async (req, res) => {
+  const { transactionId } = req.body;
+
+  if (!mongoose.Types.ObjectId.isValid(transactionId)) {
+    console.error("Invalid transaction ID:", transactionId);
+    return res.status(400).json({ error: "Invalid transaction ID" });
+  }
+
+  try {
+    const transaction = await Transaction.findById(transactionId);
+    if (!transaction) {
+      console.error("Transaction not found:", transactionId);
+      return res.status(404).json({ error: "Transaction not found" });
+    }
+    if (transaction.status !== "pending") {
+      console.error("Transaction not in pending status:", transaction.status);
+      return res
+        .status(400)
+        .json({ error: `Transaction is in ${transaction.status} status` });
+    }
+
+    await Transaction.findByIdAndDelete(transactionId);
+    console.log("Transaction cancelled:", transactionId);
+    res.json({ success: true, message: "Transaction cancelled successfully" });
+  } catch (error) {
+    console.error("Cancel transaction error:", error.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
 
 // Mark transaction as paid
 app.post("/api/mark-paid", async (req, res) => {
