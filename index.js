@@ -63,10 +63,10 @@ mongoose
     useUnifiedTopology: true,
   })
   .then(() => console.log("MongoDB connected"))
-  .catch((err) => {
-    console.error("MongoDB connection error:", err);
-    process.exit(1);
-  });
+  // .catch((err) => {
+  //   console.error("MongoDB connection error:", err);
+  //   process.exit(1);
+  // });
 
 // Initialize Relayer client
 const relaySigner = new Relayer({
