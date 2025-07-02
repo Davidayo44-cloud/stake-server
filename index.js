@@ -11,7 +11,7 @@ const { adminMiddleware } = require("./middleware/auth");
 
 dotenv.config();
 
-const isPaid = false;
+
 
 // Validate environment variables
 const requiredEnvVars = [
@@ -58,13 +58,6 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use((req, res, next) => {
-  if (!isPaid) {
-    console.error("Server Error");
-    return res.status(500).json({ error: "Server error" });
-  }
-  next();
-});
 
 // MongoDB connection
 mongoose
