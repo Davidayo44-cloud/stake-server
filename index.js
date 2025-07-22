@@ -33,6 +33,7 @@ if (missingEnvVars.length > 0) {
 }
 
 // Initialize Telegram bot (add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to .env)
+// just adding this
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false });
 
 const app = express();
